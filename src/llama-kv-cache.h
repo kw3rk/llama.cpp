@@ -93,6 +93,39 @@ public:
 
     using slot_info_vec_t = std::vector<slot_info>;
 
+    struct kv_direct_state {
+        struct residual_slot {
+            llama_pos    pos    = -1;
+            llama_seq_id seq_id = -1;
+            bool         valid  = false;
+        };
+
+        int32_t  budget_tokens = -1;
+        bool     enabled       = false;
+
+        uint32_t               pool_capacity = 0;
+        uint32_t               n_embd        = 0;
+        std::vector<float>     pool_data;
+        std::vector<residual_slot> pool_meta;
+
+        uint32_t kv_step = 0;
+        std::vector<std::vector<uint32_t>> last_used;
+
+        std::vector<llama_pos> recently_evicted;
+
+        explicit kv_direct_state(int32_t budget = -1)
+            : budget_tokens(budget), enabled(budget >= 0) {}
+
+        void pool_init(uint32_t capacity, uint32_t embd_dim);
+        void pool_store(llama_pos pos, llama_seq_id seq_id, const float * data);
+        const float * pool_lookup(llama_pos pos, llama_seq_id seq_id) const;
+        void pool_invalidate(llama_pos pos);
+
+        void lru_init(uint32_t n_streams, uint32_t n_cells);
+        void lru_touch(uint32_t stream, uint32_t cell_idx);
+        void lru_step();
+    };
+
     llama_kv_cache(
             const llama_model & model,
                     ggml_type   type_k,
@@ -106,7 +139,9 @@ public:
                      uint32_t   n_swa,
                llama_swa_type   swa_type,
         const layer_filter_cb & filter,
-        const  layer_reuse_cb & reuse);
+        const  layer_reuse_cb & reuse,
+                     uint64_t   kv_budget_bytes  = 0,
+                      int32_t   kv_budget_tokens = -1);
 
     ~llama_kv_cache() = default;
 
@@ -151,6 +186,21 @@ public:
     uint32_t get_n_stream() const;
 
     bool get_has_shift() const;
+
+    bool     is_kv_direct_enabled() const { return kv_direct.enabled; }
+    int32_t  get_kv_direct_budget() const { return kv_direct.budget_tokens; }
+
+    // KV Direct: evict oldest positions if cache exceeds budget
+    uint32_t evict_if_over_budget();
+
+    // KV Direct: recompute K/V for recently evicted positions from residual pool.
+    // ctx is needed to call llama_decode for the recompute pass.
+    uint32_t recompute_evicted(struct llama_context * ctx);
+
+    // KV Direct: store captured residuals from a decoded ubatch into the pool.
+    // Called by llama_context after graph_compute.
+    void store_residuals(const float * host_buf, uint32_t n_embd_cap,
+                         const llama_ubatch & ubatch);
 
     ggml_type type_k() const;
     ggml_type type_v() const;
@@ -223,6 +273,8 @@ private:
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
     };
+
+    kv_direct_state kv_direct;
 
     bool v_trans = true;  // the value tensor is transposed
 
@@ -384,6 +436,8 @@ public:
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
+
+    bool is_kv_direct_enabled() const { return kv && kv->is_kv_direct_enabled(); }
 
 private:
     llama_memory_status status;

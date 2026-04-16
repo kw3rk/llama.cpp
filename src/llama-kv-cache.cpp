@@ -12,6 +12,7 @@
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <unordered_set>
 
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
@@ -89,7 +90,9 @@ llama_kv_cache::llama_kv_cache(
                  uint32_t   n_swa,
            llama_swa_type   swa_type,
     const layer_filter_cb & filter,
-    const  layer_reuse_cb & reuse) :
+    const  layer_reuse_cb & reuse,
+                 uint64_t   kv_budget_bytes,
+                  int32_t   kv_budget_tokens) :
     model(model), hparams(model.hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type) {
 
@@ -280,6 +283,34 @@ llama_kv_cache::llama_kv_cache(
                 ggml_type_name(type_v), (float)memory_size_v / (1024.0f * 1024.0f));
     }
 
+    // KV Direct: resolve budget and initialize pool + LRU
+    {
+        int32_t eff_budget = kv_budget_tokens;
+        if (eff_budget < 0 && kv_budget_bytes > 0) {
+            size_t bytes_per_token = 0;
+            for (const auto & layer : layers) {
+                const uint32_t il = layer.il;
+                bytes_per_token += ggml_row_size(type_k, hparams.n_embd_k_gqa(il));
+                bytes_per_token += ggml_row_size(type_v, hparams.n_embd_v_gqa(il));
+            }
+            if (bytes_per_token > 0) {
+                eff_budget = (int32_t)(kv_budget_bytes / bytes_per_token);
+            }
+        }
+
+        kv_direct = kv_direct_state(eff_budget);
+
+        if (kv_direct.enabled) {
+            const uint32_t pool_cap = kv_direct.budget_tokens > 0 ? (uint32_t)kv_direct.budget_tokens : 0;
+            kv_direct.pool_init(pool_cap, hparams.n_embd);
+            kv_direct.lru_init(n_stream, kv_size);
+
+            LLAMA_LOG_INFO("%s: KV Direct enabled, budget = %d tokens, residual pool = %.1f MiB\n",
+                    __func__, kv_direct.budget_tokens,
+                    (double)(kv_direct.pool_capacity * kv_direct.n_embd * sizeof(float)) / (1024.0 * 1024.0));
+        }
+    }
+
     const char * LLAMA_ATTN_ROT_DISABLE = getenv("LLAMA_ATTN_ROT_DISABLE");
     const bool attn_rot_disable = LLAMA_ATTN_ROT_DISABLE ? atoi(LLAMA_ATTN_ROT_DISABLE) : false;
     if (attn_rot_disable) {
@@ -337,6 +368,14 @@ void llama_kv_cache::clear(bool data) {
             ggml_backend_buffer_clear(buf.get(), 0);
         }
     }
+
+    // KV Direct: invalidate entire residual pool
+    if (kv_direct.enabled) {
+        for (auto & meta : kv_direct.pool_meta) {
+            meta.valid = false;
+        }
+        kv_direct.recently_evicted.clear();
+    }
 }
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -361,9 +400,15 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
                 continue;
             }
 
-            if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
-                if (new_head == cells.size()) {
-                    new_head = i;
+            if (cells.seq_has(i, seq_id)) {
+                const llama_pos pos_i = cells.pos_get(i);
+                if (cells.seq_rm(i, seq_id)) {
+                    if (kv_direct.enabled) {
+                        kv_direct.pool_invalidate(pos_i);
+                    }
+                    if (new_head == cells.size()) {
+                        new_head = i;
+                    }
                 }
             }
         }
@@ -383,6 +428,10 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
             for (uint32_t i = 0; i < cells.size(); ++i) {
                 if (!cells.pos_in(i, p0, p1)) {
                     continue;
+                }
+
+                if (kv_direct.enabled) {
+                    kv_direct.pool_invalidate(cells.pos_get(i));
                 }
 
                 cells.rm(i);
@@ -2501,4 +2550,229 @@ void llama_kv_cache_context::set_input_k_rot(ggml_tensor * dst) const {
 
 void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
     kv->set_input_v_rot(dst);
+}
+
+//
+// KV Direct
+//
+
+uint32_t llama_kv_cache::evict_if_over_budget() {
+    if (!kv_direct.enabled) {
+        return 0;
+    }
+
+    uint32_t n_used = 0;
+    for (const auto & cells : v_cells) {
+        n_used += cells.get_used();
+    }
+
+    if ((int32_t)n_used <= kv_direct.budget_tokens) {
+        return 0;
+    }
+
+    const uint32_t budget = kv_direct.budget_tokens >= 0 ? (uint32_t)kv_direct.budget_tokens : 0;
+    const uint32_t n_to_evict = n_used - budget;
+
+    struct evict_candidate {
+        llama_pos pos;
+        uint32_t  stream_idx;
+        uint32_t  cell_idx;
+        uint32_t  lru_time;
+    };
+
+    std::vector<evict_candidate> candidates;
+    candidates.reserve(n_used);
+
+    for (uint32_t s = 0; s < v_cells.size(); ++s) {
+        const auto & cells = v_cells[s];
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            if (!cells.is_empty(i)) {
+                uint32_t lru = 0;
+                if (s < kv_direct.last_used.size() && i < kv_direct.last_used[s].size()) {
+                    lru = kv_direct.last_used[s][i];
+                }
+                candidates.push_back({cells.pos_get(i), s, i, lru});
+            }
+        }
+    }
+
+    std::sort(candidates.begin(), candidates.end(),
+        [](const evict_candidate & a, const evict_candidate & b) {
+            return a.lru_time < b.lru_time;
+        });
+
+    uint32_t evicted = 0;
+    for (uint32_t i = 0; i < candidates.size() && evicted < n_to_evict; ++i) {
+        const auto & ec = candidates[i];
+        auto & cells = v_cells[ec.stream_idx];
+        auto & head  = v_heads[ec.stream_idx];
+
+        if (cells.is_empty(ec.cell_idx)) {
+            continue;
+        }
+
+        kv_direct.recently_evicted.push_back(ec.pos);
+
+        cells.rm(ec.cell_idx);
+
+        if (ec.cell_idx < head) {
+            head = ec.cell_idx;
+        }
+
+        evicted++;
+    }
+
+    if (evicted > 0) {
+        LLAMA_LOG_DEBUG("%s: KV Direct evicted %u positions (budget=%u, was=%u)\n",
+                        __func__, evicted, kv_direct.budget_tokens, n_used);
+    }
+
+    return evicted;
+}
+
+void llama_kv_cache::kv_direct_state::pool_init(uint32_t capacity, uint32_t embd_dim) {
+    pool_capacity = capacity;
+    n_embd        = embd_dim;
+    pool_data.resize((size_t)capacity * embd_dim, 0.0f);
+    pool_meta.resize(capacity);
+}
+
+void llama_kv_cache::kv_direct_state::pool_store(
+        llama_pos pos, llama_seq_id seq_id, const float * data) {
+    if (pool_capacity == 0 || !data) return;
+    const uint32_t slot = (uint32_t)(pos % (llama_pos)pool_capacity);
+    memcpy(pool_data.data() + (size_t)slot * n_embd, data, n_embd * sizeof(float));
+    pool_meta[slot] = { pos, seq_id, true };
+}
+
+const float * llama_kv_cache::kv_direct_state::pool_lookup(
+        llama_pos pos, llama_seq_id seq_id) const {
+    if (pool_capacity == 0) return nullptr;
+    const uint32_t slot = (uint32_t)(pos % (llama_pos)pool_capacity);
+    const auto & meta = pool_meta[slot];
+    if (meta.valid && meta.pos == pos && meta.seq_id == seq_id) {
+        return pool_data.data() + (size_t)slot * n_embd;
+    }
+    return nullptr;
+}
+
+void llama_kv_cache::kv_direct_state::pool_invalidate(llama_pos pos) {
+    if (pool_capacity == 0) return;
+    const uint32_t slot = (uint32_t)(pos % (llama_pos)pool_capacity);
+    if (pool_meta[slot].pos == pos) {
+        pool_meta[slot].valid = false;
+    }
+}
+
+void llama_kv_cache::kv_direct_state::lru_init(uint32_t n_streams, uint32_t n_cells) {
+    last_used.resize(n_streams);
+    for (auto & v : last_used) {
+        v.assign(n_cells, 0);
+    }
+}
+
+void llama_kv_cache::kv_direct_state::lru_touch(uint32_t stream, uint32_t cell_idx) {
+    if (stream < last_used.size() && cell_idx < last_used[stream].size()) {
+        last_used[stream][cell_idx] = kv_step;
+    }
+}
+
+void llama_kv_cache::kv_direct_state::lru_step() {
+    kv_step++;
+}
+
+void llama_kv_cache::store_residuals(const float * host_buf, uint32_t n_embd_cap,
+                                     const llama_ubatch & ubatch) {
+    if (!kv_direct.enabled) return;
+
+    const uint32_t n_tokens = ubatch.n_tokens;
+
+    for (uint32_t t = 0; t < n_tokens; ++t) {
+        const llama_pos    pos    = ubatch.pos[t];
+        const llama_seq_id seq_id = ubatch.seq_id[t][0];
+        kv_direct.pool_store(pos, seq_id,
+                             host_buf + (size_t)t * n_embd_cap);
+    }
+
+    // Touch LRU for cells that were just populated by this batch.
+    // Build a set of batch positions for O(1) lookup, then scan cells once.
+    std::unordered_set<llama_pos> batch_pos(ubatch.pos, ubatch.pos + n_tokens);
+
+    for (uint32_t s = 0; s < v_cells.size(); ++s) {
+        const auto & cells = v_cells[s];
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            if (!cells.is_empty(i) && batch_pos.count(cells.pos_get(i))) {
+                kv_direct.lru_touch(s, i);
+            }
+        }
+    }
+
+    kv_direct.lru_step();
+}
+
+uint32_t llama_kv_cache::recompute_evicted(llama_context * ctx) {
+    if (!kv_direct.enabled || kv_direct.recently_evicted.empty()) {
+        return 0;
+    }
+
+    const uint32_t max_recompute = 64;
+
+    struct restore_entry {
+        llama_pos    pos;
+        llama_seq_id seq_id;
+        const float * residual;
+    };
+
+    std::vector<restore_entry> to_restore;
+
+    for (const auto & pos : kv_direct.recently_evicted) {
+        if (to_restore.size() >= max_recompute) break;
+
+        // TODO: multi-sequence support — currently assumes seq_id 0
+        const float * res = kv_direct.pool_lookup(pos, 0);
+        if (res) {
+            to_restore.push_back({ pos, 0, res });
+        }
+    }
+
+    kv_direct.recently_evicted.clear();
+
+    if (to_restore.empty()) {
+        return 0;
+    }
+
+    std::sort(to_restore.begin(), to_restore.end(),
+        [](const auto & a, const auto & b) { return a.pos < b.pos; });
+
+    const uint32_t n_restore = (uint32_t)to_restore.size();
+    const uint32_t n_embd    = kv_direct.n_embd;
+
+    llama_batch batch = llama_batch_init((int32_t)n_restore, (int32_t)n_embd, 1);
+    batch.n_tokens = (int32_t)n_restore;
+
+    for (uint32_t i = 0; i < n_restore; ++i) {
+        const auto & entry = to_restore[i];
+
+        memcpy(batch.embd + (size_t)i * n_embd,
+               entry.residual, n_embd * sizeof(float));
+
+        batch.pos[i]       = entry.pos;
+        batch.n_seq_id[i]  = 1;
+        batch.seq_id[i][0] = entry.seq_id;
+        batch.logits[i]    = 0;
+    }
+
+    int32_t rc = llama_decode(ctx, batch);
+
+    llama_batch_free(batch);
+
+    if (rc != 0) {
+        LLAMA_LOG_WARN("%s: recompute decode failed (rc=%d), %u positions lost\n",
+                       __func__, rc, n_restore);
+        return 0;
+    }
+
+    LLAMA_LOG_DEBUG("%s: KV Direct recomputed %u positions\n", __func__, n_restore);
+
+    return n_restore;
 }

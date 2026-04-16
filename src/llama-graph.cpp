@@ -801,6 +801,7 @@ int64_t llm_graph_result::get_max_nodes() const {
 void llm_graph_result::reset() {
     t_inp_tokens  = nullptr;
     t_inp_embd    = nullptr;
+    t_kv_direct_capture = nullptr;
     t_logits      = nullptr;
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
@@ -951,6 +952,14 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
         res->set_params(params);
+
+        // KV Direct: detect if the memory context supports residual capture
+        if (mctx) {
+            auto * kvc = dynamic_cast<const llama_kv_cache_context *>(mctx);
+            if (kvc && kvc->is_kv_direct_enabled()) {
+                kv_direct_enabled = true;
+            }
+        }
     }
 
 void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
@@ -963,6 +972,18 @@ ggml_tensor * llm_graph_context::build_cvec(
          ggml_tensor * cur,
                  int   il) const {
     return cvec->apply_to(ctx0, cur, il);
+}
+
+void llm_graph_context::build_kv_direct_capture_embd(ggml_tensor * embd) const {
+    if (!kv_direct_enabled) {
+        return;
+    }
+    auto * cap = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, embd->ne[0], embd->ne[1]);
+    ggml_set_name(cap, "kv_direct_cap");
+
+    ggml_build_forward_expand(gf, ggml_cpy(ctx0, embd, cap));
+
+    res->t_kv_direct_capture = cap;
 }
 
 ggml_tensor * llm_graph_context::build_lora_mm(
@@ -1702,6 +1723,9 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     // make sure the produced embeddings are immediately materialized in the ggml graph
     // ref: https://github.com/ggml-org/llama.cpp/pull/18599
     ggml_build_forward_expand(gf, cur);
+
+    // KV Direct: capture layer-0 embedding for residual pool
+    build_kv_direct_capture_embd(cur);
 
     return cur;
 }
