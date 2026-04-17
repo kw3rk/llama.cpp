@@ -1,10 +1,12 @@
-// KV Direct accuracy test: PP a long prompt, then TG with greedy sampling.
-// After every decode (PP and TG), call evict + recompute.
-// Prints TSV of (step, token_id, top_logit, token_text) for diffing across budgets.
+// KV Direct benchmark: fill context with real text, measure TG throughput.
+// Runs PP to fill context, then TG with greedy sampling, calling evict + recompute
+// after every decode. Reports PP t/s and TG t/s.
 //
 // Usage:
-//   llama-kv-direct-test -m model.gguf -f prompt.txt -c 4096 -ngl 80 \
-//       --kv-budget-tokens 512 -n 256
+//   llama-kv-direct-test -m model.gguf -f prompt.txt -c 65536 -t 64 \
+//       --kv-budget-tokens 512 -n 128
+//
+// For baseline (no KV Direct), omit --kv-budget-tokens (defaults to -1).
 
 #include "arg.h"
 #include "common.h"
@@ -16,9 +18,13 @@
 #include <string>
 #include <vector>
 
+static int64_t time_us() {
+    return ggml_time_us();
+}
+
 int main(int argc, char ** argv) {
     common_params params;
-    params.n_predict = 256;
+    params.n_predict = 128;
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_PERPLEXITY)) {
         return 1;
@@ -45,10 +51,6 @@ int main(int argc, char ** argv) {
     }
 
     std::string prompt_text = params.prompt;
-    if (!params.prompt_file.empty()) {
-        // common_params_parse with -f already loads the file into params.prompt
-        prompt_text = params.prompt;
-    }
 
     if (prompt_text.empty()) {
         fprintf(stderr, "error: prompt is empty\n");
@@ -65,20 +67,24 @@ int main(int argc, char ** argv) {
         return 1;
     }
     if ((int) prompt_tokens.size() > max_prompt) {
-        fprintf(stderr, "truncating prompt from %zu to %d tokens (ctx=%d, predict=%d)\n",
-                prompt_tokens.size(), max_prompt, n_ctx, n_predict);
         prompt_tokens.resize(max_prompt);
     }
 
-    fprintf(stderr, "prompt: %zu tokens, generating %d tokens, ctx=%d, kvbt=%d\n",
-            prompt_tokens.size(), n_predict, n_ctx, params.kv_budget_tokens);
+    const int n_prompt = (int) prompt_tokens.size();
 
-    // PP phase: decode prompt in batches
+    fprintf(stderr, "\n");
+    fprintf(stderr, "kv-direct-test: prompt = %d tokens, generate = %d tokens, ctx = %d, kvbt = %d, kvba = %d\n",
+            n_prompt, n_predict, n_ctx, params.kv_budget_tokens, params.kv_budget_auto ? 1 : 0);
+    fprintf(stderr, "\n");
+
+    // PP phase
     const int n_batch = llama_n_batch(ctx);
-    fprintf(stderr, "PP: processing %zu tokens in batches of %d...\n", prompt_tokens.size(), n_batch);
+    fprintf(stderr, "PP: processing %d tokens in batches of %d...\n", n_prompt, n_batch);
 
-    for (int i = 0; i < (int) prompt_tokens.size(); i += n_batch) {
-        const int n_tokens = std::min(n_batch, (int) prompt_tokens.size() - i);
+    const int64_t t_pp_start = time_us();
+
+    for (int i = 0; i < n_prompt; i += n_batch) {
+        const int n_tokens = std::min(n_batch, n_prompt - i);
         llama_batch batch = llama_batch_get_one(prompt_tokens.data() + i, n_tokens);
 
         if (llama_decode(ctx, batch)) {
@@ -90,19 +96,26 @@ int main(int argc, char ** argv) {
         llama_kv_direct_recompute_misses(ctx);
     }
 
-    fprintf(stderr, "PP done. Starting TG...\n");
+    llama_synchronize(ctx);
+    const int64_t t_pp_end = time_us();
+    const double pp_ms = (double)(t_pp_end - t_pp_start) / 1000.0;
+    const double pp_tps = (double)n_prompt / (pp_ms / 1000.0);
 
-    // Greedy sampler
+    fprintf(stderr, "PP done: %d tokens in %.1f ms (%.2f t/s)\n\n", n_prompt, pp_ms, pp_tps);
+
+    // Greedy sampler (temp=0)
     auto sparams = llama_sampler_chain_default_params();
     llama_sampler * smpl = llama_sampler_chain_init(sparams);
     llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
 
-    // TG phase: generate tokens one by one
-    printf("step\ttoken_id\tlogit\ttoken\n");
+    // TG phase
+    fprintf(stderr, "TG: generating %d tokens...\n", n_predict);
+
+    const int64_t t_tg_start = time_us();
+    int n_generated = 0;
 
     llama_token new_token_id;
     for (int step = 0; step < n_predict; step++) {
-        // Sample from last decode's logits
         new_token_id = llama_sampler_sample(smpl, ctx, -1);
 
         if (llama_vocab_is_eog(vocab, new_token_id)) {
@@ -110,26 +123,16 @@ int main(int argc, char ** argv) {
             break;
         }
 
-        // Get the logit value for the chosen token
-        const float * logits = llama_get_logits(ctx);
-        float top_logit = logits[new_token_id];
+        n_generated++;
 
-        // Token text
+        // Print token text to stdout
         char buf[256];
         int n = llama_token_to_piece(vocab, new_token_id, buf, sizeof(buf), 0, true);
-        std::string token_str(buf, n > 0 ? n : 0);
-
-        // Escape tabs and newlines for TSV
-        for (auto & c : token_str) {
-            if (c == '\t') c = ' ';
-            if (c == '\n') c = ' ';
-            if (c == '\r') c = ' ';
+        if (n > 0) {
+            fwrite(buf, 1, n, stdout);
+            fflush(stdout);
         }
 
-        printf("%d\t%d\t%.6f\t%s\n", step, new_token_id, top_logit, token_str.c_str());
-        fflush(stdout);
-
-        // Decode the new token
         llama_batch batch = llama_batch_get_one(&new_token_id, 1);
         if (llama_decode(ctx, batch)) {
             fprintf(stderr, "error: TG decode failed at step %d\n", step);
@@ -140,7 +143,24 @@ int main(int argc, char ** argv) {
         llama_kv_direct_recompute_misses(ctx);
     }
 
-    fprintf(stderr, "\nDone.\n");
+    llama_synchronize(ctx);
+    const int64_t t_tg_end = time_us();
+    const double tg_ms = (double)(t_tg_end - t_tg_start) / 1000.0;
+    const double tg_tps = (double)n_generated / (tg_ms / 1000.0);
+
+    fprintf(stderr, "\n\nTG done: %d tokens in %.1f ms (%.2f t/s)\n", n_generated, tg_ms, tg_tps);
+
+    // Summary
+    fprintf(stderr, "\n");
+    fprintf(stderr, "=== RESULTS ===\n");
+    fprintf(stderr, "model:    %s\n", params.model.path.c_str());
+    fprintf(stderr, "ctx:      %d\n", n_ctx);
+    fprintf(stderr, "kvbt:     %d\n", params.kv_budget_tokens);
+    fprintf(stderr, "kvba:     %d\n", params.kv_budget_auto ? 1 : 0);
+    fprintf(stderr, "prompt:   %d tokens\n", n_prompt);
+    fprintf(stderr, "PP:       %.2f t/s\n", pp_tps);
+    fprintf(stderr, "TG:       %.2f t/s  (%d tokens)\n", tg_tps, n_generated);
+    fprintf(stderr, "===============\n");
 
     llama_sampler_free(smpl);
 

@@ -316,9 +316,7 @@ llama_kv_cache::llama_kv_cache(
         }
 
         if (kv_direct.enabled) {
-            const uint32_t pool_cap = kv_direct.budget_tokens > 0
-                ? (uint32_t)kv_direct.budget_tokens : 0;
-            kv_direct.pool_init(pool_cap, hparams.n_embd);
+            kv_direct.pool_init(kv_size, hparams.n_embd);
             kv_direct.lru_init(n_stream, kv_size);
 
             LLAMA_LOG_INFO("%s: KV Direct enabled, budget = %d tokens, residual pool = %.1f MiB\n",
