@@ -383,6 +383,9 @@ static results_perplexity perplexity_v2(llama_context * ctx, const common_params
                 return {tokens, -1, logit_history, prob_history};
             }
 
+            llama_kv_direct_evict(ctx);
+            llama_kv_direct_recompute_misses(ctx);
+
             // save original token and restore it after eval
             const auto token_org = tokens[batch_start];
 
@@ -590,6 +593,9 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
                 return {tokens, -1, logit_history, prob_history};
             }
 
+            llama_kv_direct_evict(ctx);
+            llama_kv_direct_recompute_misses(ctx);
+
             if (num_batches > 1 && n_outputs > 0) {
                 const auto * batch_logits = llama_get_logits(ctx);
                 logits.insert(logits.end(), batch_logits, batch_logits + size_t(n_outputs) * n_vocab);
@@ -680,6 +686,10 @@ static bool decode_helper(llama_context * ctx, llama_batch & batch, std::vector<
             LOG_ERR("failed to decode the batch, n_batch = %d, ret = %d\n", n_batch, ret);
             return false;
         }
+
+        // KV Direct: evict + recompute if budget is active
+        llama_kv_direct_evict(ctx);
+        llama_kv_direct_recompute_misses(ctx);
 
         int n_outputs = 0;
         for (int i = 0; i < n_tokens; ++i) {
@@ -1835,6 +1845,9 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
                 llama_batch_free(batch);
                 return;
             }
+
+            llama_kv_direct_evict(ctx);
+            llama_kv_direct_recompute_misses(ctx);
 
             if (num_batches > 1 && n_outputs > 0) {
                 const auto * batch_logits = llama_get_logits(ctx);

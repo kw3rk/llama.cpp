@@ -415,6 +415,7 @@ struct common_params {
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
     uint64_t kv_budget_bytes      =     0; // KV Direct: cap KV cache at N bytes (0 = unbounded)
     int32_t  kv_budget_tokens     =    -1; // KV Direct: -1 = unbounded, 0 = no cache, N > 0 = cap at N tokens
+    bool     kv_budget_auto       = false; // KV Direct: auto-tune budget at runtime
     int32_t n_batch               =  2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
     int32_t n_ubatch              =   512; // physical batch size for prompt processing (must be >=32 to use BLAS)
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt

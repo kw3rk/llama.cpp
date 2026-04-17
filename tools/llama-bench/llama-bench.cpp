@@ -347,6 +347,7 @@ struct cmd_params {
     std::vector<size_t>              fit_params_target;
     std::vector<uint32_t>            fit_params_min_ctx;
     std::vector<int32_t>             kv_budget_tokens;
+    std::vector<bool>                kv_budget_auto;
     ggml_numa_strategy               numa;
     int                              reps;
     ggml_sched_priority              prio;
@@ -392,6 +393,7 @@ static const cmd_params cmd_params_defaults = {
     /* fit_params_target    */ { 0 },
     /* fit_params_min_ctx   */ { 0 },
     /* kv_budget_tokens     */ { -1 },
+    /* kv_budget_auto       */ { false },
     /* numa                 */ GGML_NUMA_STRATEGY_DISABLED,
     /* reps                 */ 5,
     /* prio                 */ GGML_SCHED_PRIO_NORMAL,
@@ -462,6 +464,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -nopo, --no-op-offload <0|1>                (default: 0)\n");
     printf("  --no-host <0|1>                             (default: %s)\n", join(cmd_params_defaults.no_host, ",").c_str());
     printf("  --kv-budget-tokens <n>                      (default: %s)\n", join(cmd_params_defaults.kv_budget_tokens, ",").c_str());
+    printf("  --kv-budget-auto <0|1>                     (default: %s)\n", join(cmd_params_defaults.kv_budget_auto, ",").c_str());
     printf("\n");
     printf(
         "Multiple values can be given for each parameter by separating them with ','\n"
@@ -839,6 +842,13 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 for (const auto & s : string_split<std::string>(argv[i], split_delim)) {
                     params.kv_budget_tokens.push_back(std::stoi(s));
                 }
+            } else if (arg == "--kv-budget-auto") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<bool>(argv[i], split_delim);
+                params.kv_budget_auto.insert(params.kv_budget_auto.end(), p.begin(), p.end());
             } else if (arg == "-ts" || arg == "--tensor-split") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1128,6 +1138,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.kv_budget_tokens.empty()) {
         params.kv_budget_tokens = cmd_params_defaults.kv_budget_tokens;
     }
+    if (params.kv_budget_auto.empty()) {
+        params.kv_budget_auto = cmd_params_defaults.kv_budget_auto;
+    }
 
     return params;
 }
@@ -1162,6 +1175,7 @@ struct cmd_params_instance {
     size_t             fit_target;
     uint32_t           fit_min_ctx;
     int32_t            kv_budget_tokens;
+    bool               kv_budget_auto;
 
     llama_model_params to_llama_mparams() const {
         llama_model_params mparams = llama_model_default_params();
@@ -1240,6 +1254,7 @@ struct cmd_params_instance {
         cparams.op_offload      = !no_op_offload;
         cparams.swa_full        = false;
         cparams.kv_budget_tokens = kv_budget_tokens;
+        cparams.kv_budget_auto   = kv_budget_auto;
 
         return cparams;
     }
@@ -1276,6 +1291,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & cs : params.cpu_strict)
     for (const auto & nd : params.n_depth)
     for (const auto & kvbt : params.kv_budget_tokens)
+    for (const auto & kvba : params.kv_budget_auto)
     for (const auto & pl : params.poll) {
         for (const auto & n_prompt : params.n_prompt) {
             if (n_prompt == 0) {
@@ -1311,6 +1327,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .fit_target   = */ fpt,
                 /* .fit_min_ctx  = */ fpc,
                 /* .kv_budget_tokens = */ kvbt,
+                /* .kv_budget_auto   = */ kvba,
             };
             instances.push_back(instance);
         }
@@ -1349,6 +1366,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .fit_target   = */ fpt,
                 /* .fit_min_ctx  = */ fpc,
                 /* .kv_budget_tokens = */ kvbt,
+                /* .kv_budget_auto   = */ kvba,
             };
             instances.push_back(instance);
         }
@@ -1387,6 +1405,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .fit_target   = */ fpt,
                 /* .fit_min_ctx  = */ fpc,
                 /* .kv_budget_tokens = */ kvbt,
+                /* .kv_budget_auto   = */ kvba,
             };
             instances.push_back(instance);
         }
@@ -1430,6 +1449,7 @@ struct test {
     size_t                   fit_target;
     uint32_t                 fit_min_ctx;
     int32_t                  kv_budget_tokens;
+    bool                     kv_budget_auto;
     int                      n_prompt;
     int                      n_gen;
     int                      n_depth;
@@ -1471,6 +1491,7 @@ struct test {
         fit_target     = inst.fit_target;
         fit_min_ctx    = inst.fit_min_ctx;
         kv_budget_tokens = inst.kv_budget_tokens;
+        kv_budget_auto   = inst.kv_budget_auto;
         n_prompt       = inst.n_prompt;
         n_gen          = inst.n_gen;
         n_depth        = inst.n_depth;
@@ -1529,7 +1550,7 @@ struct test {
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
             "tensor_buft_overrides",            "use_mmap",      "use_direct_io",  "embeddings",
             "no_op_offload",  "no_host",        "fit_target",     "fit_min_ctx",
-            "kv_budget_tokens",
+            "kv_budget_tokens", "kv_budget_auto",
             "n_prompt",       "n_gen",          "n_depth",
             "test_time",      "avg_ns",         "stddev_ns",     "avg_ts",         "stddev_ts"
         };
@@ -1547,7 +1568,8 @@ struct test {
             return INT;
         }
         if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" || field == "flash_attn" ||
-            field == "use_mmap" || field == "use_direct_io" || field == "embeddings" || field == "no_host") {
+            field == "use_mmap" || field == "use_direct_io" || field == "embeddings" || field == "no_host" ||
+            field == "kv_budget_auto") {
             return BOOL;
         }
         if (field == "avg_ts" || field == "stddev_ts") {
@@ -1627,6 +1649,7 @@ struct test {
                                             std::to_string(fit_target),
                                             std::to_string(fit_min_ctx),
                                             std::to_string(kv_budget_tokens),
+                                            std::to_string(kv_budget_auto),
                                             std::to_string(n_prompt),
                                             std::to_string(n_gen),
                                             std::to_string(n_depth),
@@ -1824,6 +1847,9 @@ struct markdown_printer : public printer {
         if (field == "kv_budget_tokens") {
             return 6;
         }
+        if (field == "kv_budget_auto") {
+            return 4;
+        }
 
         int width = std::max((int) field.length(), 10);
 
@@ -1881,6 +1907,9 @@ struct markdown_printer : public printer {
         }
         if (field == "kv_budget_tokens") {
             return "kvbt";
+        }
+        if (field == "kv_budget_auto") {
+            return "kvba";
         }
         return field;
     }
@@ -1968,6 +1997,9 @@ struct markdown_printer : public printer {
         }
         if (params.kv_budget_tokens.size() > 1 || params.kv_budget_tokens != cmd_params_defaults.kv_budget_tokens) {
             fields.emplace_back("kv_budget_tokens");
+        }
+        if (params.kv_budget_auto.size() > 1 || params.kv_budget_auto != cmd_params_defaults.kv_budget_auto) {
+            fields.emplace_back("kv_budget_auto");
         }
         fields.emplace_back("test");
         fields.emplace_back("t/s");
@@ -2093,12 +2125,15 @@ struct ctx_state {
     std::vector<uint8_t> buf; // the llama_context state buffer
 };
 
-static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_threads, int32_t kv_budget_tokens = -1) {
+static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_threads,
+                        int32_t kv_budget_tokens = -1, bool kv_budget_auto = false) {
     llama_set_n_threads(ctx, n_threads, n_threads);
 
     const llama_model * model   = llama_get_model(ctx);
     const llama_vocab * vocab   = llama_model_get_vocab(model);
     const int32_t       n_vocab = llama_vocab_n_tokens(vocab);
+
+    const bool kv_direct_active = (kv_budget_tokens >= 0) || kv_budget_auto;
 
     std::vector<llama_token> tokens(n_batch);
 
@@ -2115,7 +2150,7 @@ static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_th
             fprintf(stderr, "%s: failed to decode prompt batch, res = %d\n", __func__, res);
             return false;
         }
-        if (kv_budget_tokens >= 0) {
+        if (kv_direct_active) {
             llama_kv_direct_evict(ctx);
             llama_kv_direct_recompute_misses(ctx);
         }
@@ -2126,12 +2161,15 @@ static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_th
     return true;
 }
 
-static bool test_gen(llama_context * ctx, int n_gen, int n_threads, int32_t kv_budget_tokens = -1) {
+static bool test_gen(llama_context * ctx, int n_gen, int n_threads,
+                     int32_t kv_budget_tokens = -1, bool kv_budget_auto = false) {
     llama_set_n_threads(ctx, n_threads, n_threads);
 
     const llama_model * model   = llama_get_model(ctx);
     const llama_vocab * vocab   = llama_model_get_vocab(model);
     const int32_t       n_vocab = llama_vocab_n_tokens(vocab);
+
+    const bool kv_direct_active = (kv_budget_tokens >= 0) || kv_budget_auto;
 
     llama_token token = llama_vocab_get_add_bos(vocab) ? llama_vocab_bos(vocab) : std::rand() % n_vocab;
 
@@ -2141,7 +2179,7 @@ static bool test_gen(llama_context * ctx, int n_gen, int n_threads, int32_t kv_b
             fprintf(stderr, "%s: failed to decode generation batch, res = %d\n", __func__, res);
             return false;
         }
-        if (kv_budget_tokens >= 0) {
+        if (kv_direct_active) {
             llama_kv_direct_evict(ctx);
             llama_kv_direct_recompute_misses(ctx);
         }
@@ -2411,7 +2449,7 @@ int main(int argc, char ** argv) {
                     fprintf(stderr, "llama-bench: benchmark %d/%zu: prompt run %d/%d\n", params_idx, params_count,
                             i + 1, params.reps);
                 }
-                bool res = test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads, t.kv_budget_tokens);
+                bool res = test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads, t.kv_budget_tokens, t.kv_budget_auto);
                 if (!res) {
                     fprintf(stderr, "%s: error: failed to run prompt\n", __func__);
                     llama_free(ctx);
@@ -2424,7 +2462,7 @@ int main(int argc, char ** argv) {
                     fprintf(stderr, "llama-bench: benchmark %d/%zu: generation run %d/%d\n", params_idx, params_count,
                             i + 1, params.reps);
                 }
-                bool res = test_gen(ctx, t.n_gen, t.n_threads, t.kv_budget_tokens);
+                bool res = test_gen(ctx, t.n_gen, t.n_threads, t.kv_budget_tokens, t.kv_budget_auto);
                 if (!res) {
                     fprintf(stderr, "%s: error: failed to run gen\n", __func__);
                     llama_free(ctx);

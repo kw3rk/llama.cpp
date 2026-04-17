@@ -8680,7 +8680,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
-                            /* filter_recr       */ std::move(filter_recr));
+                            /* filter_recr       */ std::move(filter_recr),
+                            /* kv_budget_bytes   */ params.kv_budget_bytes,
+                            /* kv_budget_tokens  */ params.kv_budget_tokens,
+                            /* kv_budget_auto    */ params.kv_budget_auto);
                     } else {
                         res = new llama_memory_hybrid(
                             /* model             */ *this,
@@ -8698,7 +8701,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
-                            /* filter_recr       */ std::move(filter_recr));
+                            /* filter_recr       */ std::move(filter_recr),
+                            /* kv_budget_bytes   */ params.kv_budget_bytes,
+                            /* kv_budget_tokens  */ params.kv_budget_tokens,
+                            /* kv_budget_auto    */ params.kv_budget_auto);
                     }
                 } else {
                     llama_memory_i::layer_reuse_cb reuse = nullptr;
@@ -8729,7 +8735,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 cparams.n_ubatch,
                                 1,
                                 nullptr,
-                                reuse);
+                                reuse,
+                                params.kv_budget_bytes,
+                                params.kv_budget_tokens,
+                                params.kv_budget_auto);
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
 
@@ -8748,7 +8757,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 nullptr,
                                 nullptr,
                                 params.kv_budget_bytes,
-                                params.kv_budget_tokens);
+                                params.kv_budget_tokens,
+                                params.kv_budget_auto);
                     }
                 }
             }

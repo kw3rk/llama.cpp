@@ -172,6 +172,9 @@ struct llama_context {
     llama_perf_context_data perf_get_data() const;
     void perf_reset();
 
+    int64_t get_t_compute_start_us() const { return t_compute_start_us; }
+    int64_t get_n_queued_tokens()    const { return n_queued_tokens; }
+
     std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> memory_breakdown() const;
 
     //

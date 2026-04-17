@@ -1249,14 +1249,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.kv_budget_bytes = (uint64_t) value * 1024 * 1024;
         }
-    ).set_env("LLAMA_ARG_KV_BUDGET_MB").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    ).set_env("LLAMA_ARG_KV_BUDGET_MB").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PERPLEXITY}));
     add_opt(common_arg(
         {"--kv-budget-tokens"}, "N",
         "cap KV cache at N tokens, -1 = unbounded (default: -1), 0 = no cache, N > 0 = cap at N tokens",
         [](common_params & params, int value) {
             params.kv_budget_tokens = (int32_t) value;
         }
-    ).set_env("LLAMA_ARG_KV_BUDGET_TOKENS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    ).set_env("LLAMA_ARG_KV_BUDGET_TOKENS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PERPLEXITY}));
+    add_opt(common_arg(
+        {"--kv-budget-auto"},
+        "automatically tune KV cache budget at runtime based on decode performance",
+        [](common_params & params) {
+            params.kv_budget_auto = true;
+        }
+    ).set_env("LLAMA_ARG_KV_BUDGET_AUTO").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PERPLEXITY}));
     add_opt(common_arg(
         {"-n", "--predict", "--n-predict"}, "N",
         string_format(

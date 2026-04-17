@@ -100,6 +100,11 @@ public:
             bool         valid  = false;
         };
 
+        struct timing_sample {
+            uint32_t n_kv;
+            int64_t  decode_us;
+        };
+
         int32_t  budget_tokens = -1;
         bool     enabled       = false;
 
@@ -113,6 +118,21 @@ public:
 
         std::vector<llama_pos> recently_evicted;
 
+        // adaptive budget state
+        bool     auto_mode       = false;
+        uint32_t n_ctx           = 0;
+        uint32_t sample_count    = 0;
+        uint32_t adjust_interval = 16;
+        uint32_t min_calibration = RING_SIZE;
+
+        static constexpr uint32_t RING_SIZE = 32;
+        timing_sample ring[RING_SIZE]       = {};
+        uint32_t      ring_head             = 0;
+        uint32_t      ring_used             = 0;
+
+        float    attention_slope          = 0.0f;
+        float    recompute_cost_per_entry = 0.0f;
+
         explicit kv_direct_state(int32_t budget = -1)
             : budget_tokens(budget), enabled(budget >= 0) {}
 
@@ -124,6 +144,9 @@ public:
         void lru_init(uint32_t n_streams, uint32_t n_cells);
         void lru_touch(uint32_t stream, uint32_t cell_idx);
         void lru_step();
+
+        void    record_tg_sample(uint32_t n_kv, int64_t decode_us);
+        int32_t compute_optimal_budget();
     };
 
     llama_kv_cache(
@@ -141,7 +164,8 @@ public:
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
                      uint64_t   kv_budget_bytes  = 0,
-                      int32_t   kv_budget_tokens = -1);
+                      int32_t   kv_budget_tokens = -1,
+                         bool   kv_budget_auto   = false);
 
     ~llama_kv_cache() = default;
 
@@ -183,12 +207,18 @@ public:
     //
 
     uint32_t get_size()     const;
+    uint32_t get_used()     const;
     uint32_t get_n_stream() const;
 
     bool get_has_shift() const;
 
-    bool     is_kv_direct_enabled() const { return kv_direct.enabled; }
-    int32_t  get_kv_direct_budget() const { return kv_direct.budget_tokens; }
+    bool     is_kv_direct_enabled()    const { return kv_direct.enabled; }
+    int32_t  get_kv_direct_budget()    const { return kv_direct.budget_tokens; }
+    bool     is_kv_direct_auto_mode() const { return kv_direct.auto_mode; }
+
+    void kv_direct_record_tg_sample(uint32_t n_kv, int64_t decode_us) {
+        kv_direct.record_tg_sample(n_kv, decode_us);
+    }
 
     // KV Direct: evict oldest positions if cache exceeds budget
     uint32_t evict_if_over_budget();

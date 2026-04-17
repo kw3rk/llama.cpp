@@ -92,7 +92,8 @@ llama_kv_cache::llama_kv_cache(
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
                  uint64_t   kv_budget_bytes,
-                  int32_t   kv_budget_tokens) :
+                  int32_t   kv_budget_tokens,
+                     bool   kv_budget_auto) :
     model(model), hparams(model.hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type) {
 
@@ -298,10 +299,25 @@ llama_kv_cache::llama_kv_cache(
             }
         }
 
-        kv_direct = kv_direct_state(eff_budget);
+        if (kv_budget_auto && eff_budget >= 0) {
+            LLAMA_LOG_WARN("%s: --kv-budget-auto ignored because explicit budget (%d) is set\n",
+                           __func__, eff_budget);
+        }
+
+        if (kv_budget_auto && eff_budget < 0) {
+            // auto mode: pool + LRU allocated lazily on first budget tightening
+            kv_direct = kv_direct_state(-1);
+            kv_direct.auto_mode = true;
+            kv_direct.n_ctx     = kv_size;
+
+            LLAMA_LOG_INFO("%s: KV Direct auto mode: calibrating\n", __func__);
+        } else {
+            kv_direct = kv_direct_state(eff_budget);
+        }
 
         if (kv_direct.enabled) {
-            const uint32_t pool_cap = kv_direct.budget_tokens > 0 ? (uint32_t)kv_direct.budget_tokens : 0;
+            const uint32_t pool_cap = kv_direct.budget_tokens > 0
+                ? (uint32_t)kv_direct.budget_tokens : 0;
             kv_direct.pool_init(pool_cap, hparams.n_embd);
             kv_direct.lru_init(n_stream, kv_size);
 
@@ -1150,6 +1166,14 @@ uint32_t llama_kv_cache::get_size() const {
     const auto & cells = v_cells[seq_to_stream[0]];
 
     return cells.size();
+}
+
+uint32_t llama_kv_cache::get_used() const {
+    uint32_t n_used = 0;
+    for (const auto & cells : v_cells) {
+        n_used += cells.get_used();
+    }
+    return n_used;
 }
 
 uint32_t llama_kv_cache::get_n_stream() const {
@@ -2557,6 +2581,47 @@ void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
 //
 
 uint32_t llama_kv_cache::evict_if_over_budget() {
+    // auto mode: evaluate periodically, even during calibration (enabled=false)
+    if (kv_direct.auto_mode &&
+        kv_direct.sample_count >= kv_direct.min_calibration &&
+        kv_direct.sample_count % kv_direct.adjust_interval == 0) {
+
+        const int32_t new_budget = kv_direct.compute_optimal_budget();
+
+        if (!kv_direct.enabled) {
+            if (new_budget < (int32_t)kv_direct.n_ctx) {
+                // activate: allocate pool + LRU
+                kv_direct.budget_tokens = new_budget;
+                kv_direct.enabled       = true;
+
+                kv_direct.pool_init(kv_direct.n_ctx, hparams.n_embd);
+                kv_direct.lru_init(n_stream, get_size());
+
+                LLAMA_LOG_INFO("%s: auto mode activating, budget = %d (slope=%.3f, recompute=%.1f, n=%u)\n",
+                                __func__, new_budget,
+                                kv_direct.attention_slope,
+                                kv_direct.recompute_cost_per_entry,
+                                kv_direct.ring_used);
+            } else if (kv_direct.sample_count == kv_direct.min_calibration) {
+                LLAMA_LOG_DEBUG("%s: auto mode: no benefit (slope=%.3f, recompute=%.1f, n=%u)\n",
+                                __func__,
+                                kv_direct.attention_slope,
+                                kv_direct.recompute_cost_per_entry,
+                                kv_direct.ring_used);
+            }
+        } else {
+            const int32_t old_budget = kv_direct.budget_tokens;
+            if (new_budget != old_budget) {
+                kv_direct.budget_tokens = new_budget;
+                LLAMA_LOG_DEBUG("%s: budget adjusted %d -> %d (slope=%.3f, recompute=%.1f, n=%u)\n",
+                                __func__, old_budget, new_budget,
+                                kv_direct.attention_slope,
+                                kv_direct.recompute_cost_per_entry,
+                                kv_direct.ring_used);
+            }
+        }
+    }
+
     if (!kv_direct.enabled) {
         return 0;
     }
@@ -2681,6 +2746,77 @@ void llama_kv_cache::kv_direct_state::lru_step() {
     kv_step++;
 }
 
+void llama_kv_cache::kv_direct_state::record_tg_sample(uint32_t n_kv, int64_t decode_us) {
+    ring[ring_head] = { n_kv, decode_us };
+    ring_head = (ring_head + 1) % RING_SIZE;
+    if (ring_used < RING_SIZE) {
+        ring_used++;
+    }
+    sample_count++;
+}
+
+int32_t llama_kv_cache::kv_direct_state::compute_optimal_budget() {
+    if (ring_used < min_calibration) {
+        return budget_tokens;  // not enough data yet
+    }
+
+    // linear regression: y = decode_us, x = n_kv
+    // slope = Σ(x-x̄)(y-ȳ) / Σ(x-x̄)²
+    double sum_x  = 0.0;
+    double sum_y  = 0.0;
+    for (uint32_t i = 0; i < ring_used; i++) {
+        sum_x += ring[i].n_kv;
+        sum_y += ring[i].decode_us;
+    }
+    const double mean_x = sum_x / ring_used;
+    const double mean_y = sum_y / ring_used;
+
+    double num = 0.0;
+    double den = 0.0;
+    for (uint32_t i = 0; i < ring_used; i++) {
+        const double dx = ring[i].n_kv - mean_x;
+        const double dy = ring[i].decode_us - mean_y;
+        num += dx * dy;
+        den += dx * dx;
+    }
+
+    if (den < 1e-9) {
+        return (int32_t)n_ctx;  // no variance in n_kv, can't regress
+    }
+
+    // require stddev(n_kv) >= 2% of n_ctx to avoid fitting noise
+    const double stddev_x = std::sqrt(den / ring_used);
+    if (stddev_x < (double)n_ctx * 0.02) {
+        return (int32_t)n_ctx;
+    }
+
+    const double slope = num / den;
+    attention_slope = (float)slope;
+
+    if (slope <= 0.0) {
+        return (int32_t)n_ctx;  // decode doesn't slow with more KV — no benefit from eviction
+    }
+
+    if (recompute_cost_per_entry <= 0.0f) {
+        // bootstrap from mean TG time (conservative — overestimates recompute cost)
+        recompute_cost_per_entry = (float)mean_y;
+        LLAMA_LOG_DEBUG("%s: bootstrapped recompute_cost_per_entry = %.1f us from mean TG time\n",
+                        __func__, recompute_cost_per_entry);
+    }
+
+    // breakeven: optimal = n_ctx - (recompute_cost_per_entry / slope)
+    const double optimal = (double)n_ctx - ((double)recompute_cost_per_entry / slope);
+
+    if (optimal <= 0.0 || optimal >= (double)n_ctx * 0.9) {
+        return (int32_t)n_ctx;
+    }
+
+    // clamp to [64, n_ctx]
+    const int32_t clamped = (int32_t)std::max(64.0, std::min((double)n_ctx, optimal));
+
+    return clamped;
+}
+
 void llama_kv_cache::store_residuals(const float * host_buf, uint32_t n_embd_cap,
                                      const llama_ubatch & ubatch) {
     if (!kv_direct.enabled) return;
@@ -2762,7 +2898,11 @@ uint32_t llama_kv_cache::recompute_evicted(llama_context * ctx) {
         batch.logits[i]    = 0;
     }
 
+    const int64_t t_recompute_start = ggml_time_us();
+
     int32_t rc = llama_decode(ctx, batch);
+
+    const int64_t t_recompute_us = ggml_time_us() - t_recompute_start;
 
     llama_batch_free(batch);
 
@@ -2772,7 +2912,19 @@ uint32_t llama_kv_cache::recompute_evicted(llama_context * ctx) {
         return 0;
     }
 
-    LLAMA_LOG_DEBUG("%s: KV Direct recomputed %u positions\n", __func__, n_restore);
+    // update recompute cost estimate (EMA, alpha=0.3)
+    if (kv_direct.auto_mode && n_restore > 0) {
+        const float measured = (float)t_recompute_us / (float)n_restore;
+        if (kv_direct.recompute_cost_per_entry <= 0.0f) {
+            kv_direct.recompute_cost_per_entry = measured;
+        } else {
+            kv_direct.recompute_cost_per_entry =
+                0.7f * kv_direct.recompute_cost_per_entry + 0.3f * measured;
+        }
+    }
+
+    LLAMA_LOG_DEBUG("%s: KV Direct recomputed %u positions (%.1f us/entry)\n",
+                    __func__, n_restore, (double)t_recompute_us / n_restore);
 
     return n_restore;
 }

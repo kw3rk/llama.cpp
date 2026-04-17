@@ -6,6 +6,9 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-kv-cache.h"
+#include "llama-kv-cache-iswa.h"
+#include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-iswa.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -281,6 +284,7 @@ llama_context::llama_context(
             /*.swa_full          =*/ params.swa_full,
             /*.kv_budget_bytes   =*/ params.kv_budget_bytes,
             /*.kv_budget_tokens  =*/ params.kv_budget_tokens,
+            /*.kv_budget_auto    =*/ params.kv_budget_auto,
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
@@ -2939,6 +2943,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.kv_budget_auto              =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
     };
@@ -3340,20 +3345,50 @@ bool llama_memory_can_shift(llama_memory_t mem) {
     return mem->get_can_shift();
 }
 
+// unwrap the base llama_kv_cache from any memory wrapper
+static llama_kv_cache * resolve_kv_cache(llama_memory_i * mem) {
+    if (!mem) {
+        return nullptr;
+    }
+
+    if (auto * kvc = dynamic_cast<llama_kv_cache *>(mem)) {
+        return kvc;
+    }
+    if (auto * iswa = dynamic_cast<llama_kv_cache_iswa *>(mem)) {
+        return iswa->get_base();
+    }
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        return hybrid->get_mem_attn();
+    }
+    if (auto * hybrid_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(mem)) {
+        auto * iswa_inner = hybrid_iswa->get_mem_attn();
+        return iswa_inner ? iswa_inner->get_base() : nullptr;
+    }
+
+    return nullptr;
+}
+
 uint32_t llama_kv_direct_evict(llama_context * ctx) {
     if (!ctx) {
         return 0;
     }
 
-    // Ensure all async GPU work from the previous decode is complete before
-    // touching KV cache metadata. graph_compute is async, so without sync
-    // the backend scheduler may still hold references to tensors backed by
-    // the cells we are about to free.
+    auto * kvc = resolve_kv_cache(ctx->get_memory());
+    if (!kvc || (!kvc->is_kv_direct_enabled() && !kvc->is_kv_direct_auto_mode())) {
+        return 0;
+    }
+
+    // snapshot timing BEFORE synchronize() resets t_compute_start_us
+    const int64_t t_start  = ctx->get_t_compute_start_us();
+    const int64_t n_queued = ctx->get_n_queued_tokens();
+
     ctx->synchronize();
 
-    auto * kvc = dynamic_cast<llama_kv_cache *>(ctx->get_memory());
-    if (!kvc || !kvc->is_kv_direct_enabled()) {
-        return 0;
+    const int64_t t_decode_us = (t_start > 0) ? (ggml_time_us() - t_start) : 0;
+
+    // only single-token decodes carry clean per-entry signal for the regression
+    if (kvc->is_kv_direct_auto_mode() && n_queued == 1 && t_decode_us > 0) {
+        kvc->kv_direct_record_tg_sample(kvc->get_used(), t_decode_us);
     }
 
     return kvc->evict_if_over_budget();
@@ -3366,7 +3401,7 @@ uint32_t llama_kv_direct_recompute_misses(llama_context * ctx) {
 
     ctx->synchronize();
 
-    auto * kvc = dynamic_cast<llama_kv_cache *>(ctx->get_memory());
+    auto * kvc = resolve_kv_cache(ctx->get_memory());
     if (!kvc || !kvc->is_kv_direct_enabled()) {
         return 0;
     }

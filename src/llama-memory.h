@@ -24,6 +24,7 @@ struct llama_memory_params {
     // KV Direct budget: -1 = unbounded (default), 0 = no cache, N > 0 = cap at N tokens
     uint64_t kv_budget_bytes;
     int32_t  kv_budget_tokens;
+    bool     kv_budget_auto;
 };
 
 enum llama_memory_status {

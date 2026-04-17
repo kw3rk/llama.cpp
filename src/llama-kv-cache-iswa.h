@@ -26,7 +26,10 @@ public:
                      uint32_t   n_ubatch,
                      uint32_t   n_pad,
         const layer_filter_cb & filter,
-        const  layer_reuse_cb & reuse);
+        const  layer_reuse_cb & reuse,
+                     uint64_t   kv_budget_bytes  = 0,
+                      int32_t   kv_budget_tokens = -1,
+                         bool   kv_budget_auto   = false);
 
     ~llama_kv_cache_iswa() = default;
 

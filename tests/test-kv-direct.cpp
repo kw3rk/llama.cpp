@@ -1,4 +1,5 @@
 #include <cassert>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -124,6 +125,134 @@ static void test_lru() {
     printf("  PASS\n");
 }
 
+static void test_auto_mode_init() {
+    printf("test_auto_mode_init...\n");
+
+    // lazy init: auto mode starts disabled, pool allocated on first budget tightening
+    llama_kv_cache::kv_direct_state state(-1);
+    state.auto_mode = true;
+    state.n_ctx     = 1024;
+
+    assert(!state.enabled);
+    assert(state.auto_mode);
+    assert(state.budget_tokens == -1);
+    assert(state.n_ctx == 1024);
+    assert(state.sample_count == 0);
+    assert(state.ring_used == 0);
+    assert(state.pool_capacity == 0);
+
+    printf("  PASS\n");
+}
+
+static void test_ring_buffer() {
+    printf("test_ring_buffer...\n");
+
+    llama_kv_cache::kv_direct_state state(1024);
+    state.auto_mode = true;
+    state.n_ctx     = 1024;
+
+    // Fill ring buffer past capacity
+    for (uint32_t i = 0; i < llama_kv_cache::kv_direct_state::RING_SIZE + 10; i++) {
+        state.record_tg_sample(100 + i, 1000 + (int64_t)i * 10);
+    }
+
+    // ring_used should be capped at RING_SIZE
+    assert(state.ring_used == llama_kv_cache::kv_direct_state::RING_SIZE);
+    // sample_count tracks total
+    assert(state.sample_count == llama_kv_cache::kv_direct_state::RING_SIZE + 10);
+    // ring_head should have wrapped
+    assert(state.ring_head == 10);
+
+    // Verify the oldest sample in the ring (at position ring_head) is the 10th sample
+    // (first 10 were overwritten by the last 10)
+    assert(state.ring[state.ring_head].n_kv == 110);
+    assert(state.ring[state.ring_head].decode_us == 1100);
+
+    printf("  PASS\n");
+}
+
+static void test_compute_optimal_budget() {
+    printf("test_compute_optimal_budget...\n");
+
+    llama_kv_cache::kv_direct_state state(4096);
+    state.auto_mode       = true;
+    state.n_ctx           = 4096;
+    state.min_calibration = 4;  // lower for testing
+
+    // Not enough samples — should return current budget
+    state.record_tg_sample(1000, 100);
+    state.record_tg_sample(2000, 200);
+    assert(state.compute_optimal_budget() == 4096);
+
+    // Feed synthetic linear data: decode_us = 0.1 * n_kv
+    // slope = 0.1 us/entry
+    for (uint32_t i = 0; i < 20; i++) {
+        uint32_t n_kv = 500 + i * 100;
+        int64_t  us   = (int64_t)(n_kv * 0.1);
+        state.record_tg_sample(n_kv, us);
+    }
+
+    // Set recompute cost: 50 us/entry
+    // optimal = n_ctx - (recompute_cost / slope) = 4096 - (50 / 0.1) = 4096 - 500 = 3596
+    state.recompute_cost_per_entry = 50.0f;
+    assert(state.compute_optimal_budget() == 3596);
+
+    // Test bootstrap: when recompute_cost_per_entry is 0, it gets bootstrapped from mean TG time
+    llama_kv_cache::kv_direct_state state_boot(4096);
+    state_boot.auto_mode       = true;
+    state_boot.n_ctx           = 4096;
+    state_boot.min_calibration = 4;
+
+    // Feed data: decode_us = 10000 + n_kv * 5 (slope=5, mean_y~17250)
+    // With bootstrap: recompute cost = mean_y, optimal = 4096 - (17250 / 5) = 4096 - 3450 = 646
+    for (uint32_t i = 0; i < 20; i++) {
+        uint32_t n_kv = 1000 + i * 100;
+        int64_t  us   = 10000 + (int64_t)(n_kv * 5);
+        state_boot.record_tg_sample(n_kv, us);
+    }
+    int32_t bootstrapped = state_boot.compute_optimal_budget();
+    assert(bootstrapped > 0 && bootstrapped < 4096);  // bootstrap produced a real budget
+    assert(state_boot.recompute_cost_per_entry > 0.0f);  // bootstrap set the cost
+
+    printf("  PASS\n");
+}
+
+static void test_auto_safety_rails() {
+    printf("test_auto_safety_rails...\n");
+
+    llama_kv_cache::kv_direct_state state(4096);
+    state.auto_mode       = true;
+    state.n_ctx           = 4096;
+    state.min_calibration = 4;
+
+    // Feed constant timing (zero slope) — should return n_ctx
+    for (uint32_t i = 0; i < 20; i++) {
+        state.record_tg_sample(500 + i * 100, 1000);  // same decode_us regardless of n_kv
+    }
+    state.recompute_cost_per_entry = 50.0f;
+    // slope should be ~0, regression will find no benefit
+    // Fit should give slope = 0 => return n_ctx
+    assert(state.compute_optimal_budget() == 4096);
+
+    // Test 90% threshold: if optimal >= 0.9 * n_ctx, return n_ctx
+    llama_kv_cache::kv_direct_state state2(4096);
+    state2.auto_mode       = true;
+    state2.n_ctx           = 4096;
+    state2.min_calibration = 4;
+
+    // slope = 1.0 us/entry, recompute_cost = 50 us/entry
+    // optimal = 4096 - (50 / 1.0) = 4046 (which is > 0.9 * 4096 = 3686)
+    for (uint32_t i = 0; i < 20; i++) {
+        uint32_t n_kv = 500 + i * 100;
+        int64_t  us   = (int64_t)n_kv;  // slope = 1.0 us/entry, clean integer data
+        state2.record_tg_sample(n_kv, us);
+    }
+    state2.recompute_cost_per_entry = 50.0f;
+    assert(state2.compute_optimal_budget() == 4096);  // 4046 > 3686, above 90% threshold
+
+    printf("  PASS\n");
+}
+
 int main() {
     test_disabled_state();
     test_zero_budget_state();
@@ -132,6 +261,10 @@ int main() {
     test_pool_invalidate();
     test_pool_ring_buffer_wraparound();
     test_lru();
+    test_auto_mode_init();
+    test_ring_buffer();
+    test_compute_optimal_budget();
+    test_auto_safety_rails();
 
     printf("\nAll KV Direct tests passed!\n");
     return 0;
